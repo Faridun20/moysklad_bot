@@ -209,7 +209,7 @@ def seeded(isolated_db):
 
 
 def _run(ms_api, *, dry_run=False, supplier_history="ledger", balances=None, returns=None,
-         orders_owner=None, owner_map=None):
+         orders_owner=None, owner_map=None, skip_unshipped_orders=False):
     orders = asyncio.run(mig.pull_orders())
     demands = asyncio.run(mig.pull_demands())
     payments = asyncio.run(mig.pull_payments())
@@ -224,6 +224,7 @@ def _run(ms_api, *, dry_run=False, supplier_history="ledger", balances=None, ret
             currencies=currencies, dry_run=dry_run, supplier_history=supplier_history,
             balances=balances, returns=returns, orders_owner=orders_owner,
             owner_map=owner_map, employees=asyncio.run(mig.pull_employees()),
+            skip_unshipped_orders=skip_unshipped_orders,
         )
     )
 
@@ -1422,6 +1423,31 @@ def test_unshipped_ms_order_is_kept_to_ship_and_noted(seeded, ms_api):
     notes = [x for k, v in unmatched.info.items() if "без отгрузки" in k for x in v]
     assert len(notes) == 1 and "Согласован" in notes[0]
     assert stats["client_debts_open"] == 1, "виден и в предпросмотре «Долгов»"
+
+
+def test_skip_unshipped_orders_settles_by_turnover(seeded, ms_api):
+    """Прод 16.09: заказ МС без отгрузки числился долгом и забирал деньги FIFO.
+    С --skip-unshipped-orders он не переносится, а платёж с основанием «этот
+    заказ» ложится FIFO на отгрузку того же клиента: долг = отгружено − получено."""
+    ms_api["customerorder"] = [_order(), _order(ms_id="ord-2", name="00002")]
+    ms_api["demand"] = [_demand()]  # отгружен только первый
+    ms_api["paymentin"] = [_paymentin(op=("customerorder", "ord-2"))]
+
+    stats, unmatched, problems = _run(ms_api, skip_unshipped_orders=True)
+
+    assert problems == []
+    assert stats["orders_unshipped_skipped"] == 1
+    assert len(_rows(seeded, "SELECT id FROM orders")) == 1
+    pays = _rows(seeded, "SELECT order_id, amount_cents FROM payments")
+    assert sum(p["amount_cents"] for p in pays) == 300000
+    assert stats["client_debts_open"] == 0, "оборот сошёлся — долга нет"
+    notes = [x for k, v in unmatched.info.items() if "НЕ перенесён" in k for x in v]
+    assert len(notes) == 1 and "00002" in notes[0]
+
+
+def test_skip_unshipped_orders_cli_flag():
+    assert mig._parse_args(["--dry-run", "--skip-unshipped-orders"]).skip_unshipped_orders
+    assert not mig._parse_args(["--dry-run"]).skip_unshipped_orders
 
 
 def test_settled_mode_closes_supplier_history(seeded, ms_api):

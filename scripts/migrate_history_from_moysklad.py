@@ -971,6 +971,7 @@ async def write_history(
     orders_owner: int | None = None,
     owner_map: list[tuple[str, int]] | None = None,
     employees: list[dict] | None = None,
+    skip_unshipped_orders: bool = False,
 ) -> tuple[dict, Unmatched, list[str]]:
     """Перенести историю одной транзакцией. Частично применённой не бывает.
 
@@ -1091,6 +1092,23 @@ async def write_history(
                         f"{label} — «{o['agent_name'] or '—'}» ({o['agent_ms_id'] or 'без agent'})",
                     )
                 group = demands_by_order.get(o["ms_id"], [])
+                if skip_unshipped_orders and not group:
+                    # Решение владельца 16.09: платежи в МС часто не привязаны к
+                    # заказу, и расчёт с клиентом сверяется по ОБОРОТУ —
+                    # отгружено против получено. Заказ, по которому ничего не
+                    # отгружали, в оборот не входит: перенесённый «к отгрузке», он
+                    # числился бы долгом и забирал бы на себя деньги FIFO.
+                    # Платёж с таким основанием уходит в FIFO по отгрузкам.
+                    stats["orders_unshipped_skipped"] += 1
+                    unmatched.note(
+                        "заказ МС без отгрузки — НЕ перенесён (расчёт по обороту: "
+                        "отгружено против получено); если актуален — оформить заново",
+                        f"{label} от {o['moment'][:10]} — «{o['agent_name'] or '—'}», "
+                        f"статус МС «{o['state_name'] or '—'}», сумма "
+                        f"{_money(o['sum_minor'])} {o['currency']}, оплачено в МС "
+                        f"{_money(o['payed_minor'])}",
+                    )
+                    continue
                 # Позиции самого заказа нужны для сверки «отгружено ≤ заказано».
                 # У заказа с отгрузками они не пишутся — и о «позиции без
                 # карточки» за них скажет строка отгрузки, а не второй раз заказ.
@@ -2877,6 +2895,7 @@ async def explain_order(name: str) -> int:
 async def main(
     mode: str, *, supplier_history: str = "ledger", orders_owner: int | None = None,
     owner_map: list[tuple[str, int]] | None = None,
+    skip_unshipped_orders: bool = False,
 ) -> int:
     """`orders_owner` — Telegram-id «по умолчанию» (`--orders-owner-default`),
     `owner_map` — пары (ключ сотрудника МС, Telegram-id) из `--orders-owner-map`."""
@@ -2922,6 +2941,7 @@ async def main(
                 currencies=currencies, dry_run=(mode == "dry-run"),
                 supplier_history=supplier_history, balances=balances, returns=returns,
                 orders_owner=orders_owner, owner_map=owner_map, employees=employees,
+                skip_unshipped_orders=skip_unshipped_orders,
             )
         except MigrationStop as e:
             logger.error("")
@@ -2994,6 +3014,13 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
              "user_id 0 «Перенос из МойСклад» (видит только руководство)",
     )
     p.add_argument(
+        "--skip-unshipped-orders",
+        action="store_true",
+        help="не переносить заказы МС, по которым не было ни одной отгрузки: расчёт с "
+             "клиентом — по обороту (отгружено против получено), а такой заказ числился "
+             "бы долгом и забирал бы деньги при разнесении",
+    )
+    p.add_argument(
         "--orders-owner",
         type=int,
         metavar="TELEGRAM_ID",
@@ -3027,4 +3054,5 @@ if __name__ == "__main__":
     sys.exit(asyncio.run(main(
         _mode, supplier_history=args.supplier_history or "ledger",
         orders_owner=args.orders_owner_default, owner_map=args.orders_owner_map,
+        skip_unshipped_orders=args.skip_unshipped_orders,
     )))
