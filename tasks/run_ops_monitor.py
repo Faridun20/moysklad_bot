@@ -345,6 +345,7 @@ async def main() -> int:
     except Exception:
         logger.exception("ops_monitor: ошибка")
         return 1
+    finally:
         await close_tg_session()
 
 

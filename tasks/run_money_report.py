@@ -63,6 +63,7 @@ async def main() -> int:
     except Exception:
         logger.exception("money_report: ошибка")
         return 1
+    finally:
         await close_tg_session()
 
 
