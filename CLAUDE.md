@@ -32,6 +32,11 @@ python -m scripts.apply_constraints          # РАЗОВО (по умолчан
                                            # нарушители — в отчёт), снять лишние индексы (--apply)
 python -m scripts.migrate_history_from_moysklad --dry-run   # РАЗОВО: история МС —
                                            # продажи И закупки. Остатки не двигает.
+                                           # --orders-owner <tg id>: заказы на сотрудника
+python -m scripts.reset_business_data      # РАЗОВО (dry-run по умолчанию): стереть бизнес-
+                                           # данные перед повторным переносом из МС, оставить
+                                           # сотрудников/роли. День переноса —
+                                           # docs/RUNBOOK_MOYSKLAD_RESET.md
 
 # Cron CLIs (Railway Cron Jobs)
 python -m tasks.run_debts_notify
