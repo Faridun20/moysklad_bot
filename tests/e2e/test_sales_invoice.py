@@ -56,6 +56,8 @@ def test_manager_shows_the_invoice_before_the_request_and_then_ships(open_app, e
     # Заявку ещё НЕ отправляли — возвращаемся в список и печатаем счёт.
     go(mgr, "sales")
     tab(mgr, "orders")
+    # «Счёт на оплату» — в подробной сводке карточки.
+    mgr.click("#content [data-details-toggle]")
     mgr.wait_for_selector(".btn-sales-invoice")
     order_id = e2e.rows("SELECT id FROM orders ORDER BY id DESC LIMIT 1")[0]["id"]
     assert e2e.rows("SELECT status FROM orders WHERE id = ?", (order_id,))[0]["status"] == "draft"
@@ -107,6 +109,8 @@ def test_manager_shows_the_invoice_before_the_request_and_then_ships(open_app, e
     # После отгрузки счёт остаётся — это просто копия того же документа.
     go(mgr, "sales")
     tab(mgr, "orders")
+    # «Счёт на оплату» — в подробной сводке карточки.
+    mgr.click("#content [data-details-toggle]")
     mgr.wait_for_selector(".btn-sales-invoice")
 
 

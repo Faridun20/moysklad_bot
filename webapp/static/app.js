@@ -4564,6 +4564,9 @@ let currentOrderPeriod = 'all';  // 'all' | 'today' | '7d' | '30d' | 'custom'
 let currentOrderFrom = '';       // YYYY-MM-DD — кастомный диапазон (period='custom')
 let currentOrderTo = '';
 let currentDraftOrder = null; // активный черновик
+// Карточки заказов, у которых раскрыта подробная сводка («Подробнее»):
+// переживает перерисовку списка после действий и смены фильтра.
+const orderDetailsOpen = new Set();
 
 // Имена иконок спрайта по статусу заказа (вместо прежних эмодзи: рендерятся
 // одинаково на всех клиентах и тинтуются под тему). Цвет задаёт .icon-<status>.
@@ -5132,30 +5135,45 @@ function renderOrdersMain(opts = {}) {
             bits.push(`<span class="order-pay order-pay--bad">${icon('return')} ${escapeHtml(o.rejection_comment)}</span>`);
           return bits.length ? `<div class="order-pay-row">${bits.join('')}</div>` : '';
         })()}
-        ${(o.payment_parts || []).length ? `
-          <div class="debt-breakdown order-parts">${o.payment_parts
-            .filter(p => p.state !== 'rejected')
-            .map(p => `<span>${icon(p.method === 'cash' ? 'cash' : 'card')} ${escapeHtml(payPartLine(p))}</span>`).join('')}</div>` : ''}
-        ${o.items.slice(0, 2).map(it => {
-          const sub = (it.quantity || 0) * (it.price || 0);
-          const cur = o.currency ? ' ' + escapeHtml(o.currency) : '';
-          const priceStr = (it.price && it.price > 0)
-            ? ` × ${formatMoney(it.price)} = <b>${formatMoney(sub)}${cur}</b>`
-            : '';
-          // Скидка к прайсу — тем же хвостом, что в карточке решения: строка
-          // в списке и строка в «Решениях» должны читаться одинаково.
-          const discStr = (it.price && it.price > 0)
-            ? escapeHtml(discountLineSuffix(it, o.currency || '')) : '';
-          return `<div class="order-item-preview">• ${escapeHtml(it.name)} — ${it.quantity} ${escapeHtml(it.unit || 'шт')}${priceStr}${discStr}</div>`;
-        }).join('')}
-        ${orderPhotosHtml(o, isBoss)}
-        <button type="button" class="order-timeline-toggle" data-timeline-toggle="${o.id}">${icon('clock')} История</button>
-        <div class="order-timeline" id="order-timeline-${o.id}" hidden></div>
-        ${salesInvoiceAvailable(o, { role, work: workActionsVisible() }) ? `
-          <div class="draft-actions">
-            <button class="btn-secondary btn-sales-invoice" data-id="${o.id}">${icon('list')} Счёт на оплату</button>
-          </div>
-        ` : ''}
+        ${(() => {
+          // Краткая сводка: что в заказе — одной строкой. Раньше карточка
+          // показывала первые ДВА товара без пометки «ещё N» — владелец увидел
+          // 2 строки при «3 товара» и принял это за расхождение.
+          const brief = orderItemsBrief(o.items, o.items_count);
+          return brief ? `<div class="order-items-brief">${escapeHtml(brief)}</div>` : '';
+        })()}
+        <button type="button" class="order-details-toggle" data-details-toggle="${o.id}"
+                aria-expanded="${orderDetailsOpen.has(o.id)}" aria-controls="order-details-${o.id}">
+          Подробнее ${icon('chevron-down')}
+        </button>
+        <div class="order-details" id="order-details-${o.id}" ${orderDetailsOpen.has(o.id) ? '' : 'hidden'}>
+          ${o.items.length ? `<div class="order-details-label">Товары</div>` : ''}
+          ${o.items.map(it => {
+            const sub = (it.quantity || 0) * (it.price || 0);
+            const cur = o.currency ? ' ' + escapeHtml(o.currency) : '';
+            const priceStr = (it.price && it.price > 0)
+              ? ` × ${formatMoney(it.price)} = <b>${formatMoney(sub)}${cur}</b>`
+              : '';
+            // Скидка к прайсу — тем же хвостом, что в карточке решения: строка
+            // в списке и строка в «Решениях» должны читаться одинаково.
+            const discStr = (it.price && it.price > 0)
+              ? escapeHtml(discountLineSuffix(it, o.currency || '')) : '';
+            return `<div class="order-item-preview">• ${escapeHtml(it.name)} — ${it.quantity} ${escapeHtml(it.unit || 'шт')}${priceStr}${discStr}</div>`;
+          }).join('')}
+          ${(o.payment_parts || []).filter(p => p.state !== 'rejected').length ? `
+            <div class="order-details-label">Оплата</div>
+            <div class="debt-breakdown order-parts">${o.payment_parts
+              .filter(p => p.state !== 'rejected')
+              .map(p => `<span class="pay-part-row">${icon(p.method === 'cash' ? 'cash' : 'card')}<span class="pay-part-text">${escapeHtml(payPartLine(p))}</span></span>`).join('')}</div>` : ''}
+          ${orderPhotosHtml(o, isBoss)}
+          <button type="button" class="order-timeline-toggle" data-timeline-toggle="${o.id}">${icon('clock')} История</button>
+          <div class="order-timeline" id="order-timeline-${o.id}" hidden></div>
+          ${salesInvoiceAvailable(o, { role, work: workActionsVisible() }) ? `
+            <div class="draft-actions">
+              <button class="btn-secondary btn-sales-invoice" data-id="${o.id}">${icon('list')} Счёт на оплату</button>
+            </div>
+          ` : ''}
+        </div>
         ${o.status === 'draft' && !isBoss ? `
           <div class="draft-actions">
             <button class="btn-edit-order" data-id="${o.id}">${icon('edit')} Редактировать</button>
@@ -5391,6 +5409,21 @@ function renderOrdersMain(opts = {}) {
   // История заказа (C3) — лениво, по нажатию: список заказов может быть
   // длинным, и грузить ленту решений по КАЖДОЙ карточке заранее (N+1) незачем
   // тому, кто её не откроет.
+  // Подробная сводка заказа: по умолчанию карточка краткая.
+  document.querySelectorAll('[data-details-toggle]').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      haptic('light');
+      const id = parseInt(btn.dataset.detailsToggle, 10);
+      const box = document.getElementById(`order-details-${id}`);
+      if (!box) return;
+      const open = box.hidden;
+      box.hidden = !open;
+      btn.setAttribute('aria-expanded', String(open));
+      if (open) orderDetailsOpen.add(id); else orderDetailsOpen.delete(id);
+    });
+  });
+
   document.querySelectorAll('[data-timeline-toggle]').forEach(btn => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();

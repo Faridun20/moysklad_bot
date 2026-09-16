@@ -100,6 +100,7 @@ def test_manager_pays_cash_and_new_card_boss_checks_it_in_decisions(open_app, e2
         "SELECT pp.method, a.card_last4 FROM payment_parts pp LEFT JOIN payment_part_accounts ppa ON ppa.part_id = pp.id "
         "LEFT JOIN acc_accounts a ON a.id = ppa.account_id ORDER BY pp.id") == [
         {"method": "cash", "card_last4": None}, {"method": "card", "card_last4": "1234"}]
+    mgr.click(f'.order-card[data-id="{oid}"] [data-details-toggle]')
     mgr.wait_for_selector(f'.order-card[data-id="{oid}"] .order-parts')
     parts = _norm(mgr.locator(f'.order-card[data-id="{oid}"] .order-parts').inner_text())
     assert f"{CARD_LABEL} · 7 130 USD — ждёт проверки банка" in parts
@@ -259,5 +260,6 @@ def test_boss_manages_cards_in_settings_archived_card_is_not_offered(open_app, e
 
     go(mgr, "sales")
     card = f'.order-card[data-id="{old["order_id"]}"] .order-parts'
+    mgr.click(f'.order-card[data-id="{old["order_id"]}"] [data-details-toggle]')
     mgr.wait_for_selector(card)
     assert "на карту •••• 1234 (Фаридун Масуджанов) · 300 USD" in _norm(mgr.locator(card).inner_text())

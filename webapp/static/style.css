@@ -1552,12 +1552,35 @@ body.nav-drawer-open { overflow: hidden; }
 }
 
 .order-meta {
-  display: flex; justify-content: space-between;
+  display: flex; justify-content: space-between; align-items: center;
   font-size: 12px; color: var(--text-mute);
   margin-bottom: 8px; gap: 8px;
 }
+/* Иконка и подпись — одним рядом по центру. Иконка по умолчанию 20px при
+   кегле 12px стояла выше текста («3 товара», сумма): владелец обвёл это на
+   скриншоте. */
+.order-meta > span { display: inline-flex; align-items: center; gap: 4px; min-width: 0; }
+.order-meta .ic { --ic-size: 15px; vertical-align: 0; }
 
 .order-total { color: var(--text); font-weight: 600; }
+
+/* Краткая сводка заказа: что в заказе — одной строкой, подробности — по кнопке. */
+.order-items-brief {
+  font-size: 13px; color: var(--text-mute); margin-bottom: 8px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.order-details-toggle {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: none; border: 0; padding: 8px 0; min-height: 44px;
+  color: var(--accent); font: inherit; font-size: 14px; cursor: pointer;
+}
+.order-details-toggle .ic { --ic-size: 16px; vertical-align: 0; transition: transform .15s; }
+.order-details-toggle[aria-expanded="true"] .ic { transform: rotate(180deg); }
+.order-details { padding-top: 4px; }
+.order-details-label {
+  font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: .04em;
+  color: var(--text-mute); margin: 8px 0 4px;
+}
 
 /* Самодостаточная карточка заказа: тип оплаты / статус / заморозка инлайн. */
 .order-pay-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 8px; }
@@ -2289,6 +2312,13 @@ body.nav-drawer-open { overflow: hidden; }
   display: flex; align-items: center; flex-wrap: wrap; gap: 4px; min-width: 0;
 }
 .debt-breakdown .ic { --ic-size: 15px; }
+/* Строка оплаты «иконка + длинный текст»: без переноса РЯДА. С flex-wrap
+   длинный текст целиком уезжал на следующую строку, а иконка оставалась одна
+   сверху (скриншот владельца). Текст переносится внутри своей колонки, иконка
+   держится у первой строки. */
+.debt-breakdown > span.pay-part-row { flex-wrap: nowrap; align-items: flex-start; }
+.pay-part-row .ic { margin-top: 2px; }
+.pay-part-row .pay-part-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .debt-breakdown b {
   color: var(--text); margin-left: auto; white-space: nowrap;
   font-variant-numeric: tabular-nums;

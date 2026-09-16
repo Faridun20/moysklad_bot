@@ -91,6 +91,8 @@ def test_paid_order_split_payment_handover_and_confirmation_close_the_debt(open_
         {"method": "cash", "currency": "USD", "amount_cents": 500_000},
         {"method": "card", "currency": "USD", "amount_cents": 713_000},
     ]
+    # Разбивка оплаты — в подробной сводке карточки (по умолчанию свёрнута).
+    mgr.click(f'.order-card[data-id="{oid}"] [data-details-toggle]')
     mgr.wait_for_selector(f'.order-card[data-id="{oid}"] .order-parts')
     parts = _norm(mgr.locator(f'.order-card[data-id="{oid}"] .order-parts').inner_text())
     assert "наличные 5 000 USD — у менеджера, ждут сдачи в кассу" in parts

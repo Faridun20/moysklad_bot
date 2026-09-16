@@ -1093,6 +1093,19 @@
     return Number.isFinite(n) ? n : 0;
   }
 
+  // Краткая сводка «что в заказе» одной строкой: «Zic 15w-40, Kixx 15w-40 и ещё 1».
+  // `total` — сколько позиций в заказе на самом деле (items_count с сервера):
+  // превью позиций может прийти неполным, и «2 товара из 3» без «ещё 1»
+  // выглядело расхождением (жалоба владельца: отгружено 3, показано 2).
+  function orderItemsBrief(items, total, shown = 2) {
+    const list = (items || []).filter(it => it && it.name);
+    const count = Math.max(Number(total) || 0, list.length);
+    if (!count) return '';
+    const names = list.slice(0, shown).map(it => String(it.name));
+    const rest = count - names.length;
+    return rest > 0 ? `${names.join(', ')} и ещё ${rest}` : names.join(', ');
+  }
+
   // ─── Раздел «Клиенты»: список покупателей (/api/clients/list) ─────────────
   //
   // «Сколько отдано, когда была проведена отгрузка, на какую общую сумму он
@@ -1623,7 +1636,7 @@
     leadFunnelHtml, firstTouchHtml, replySpeedHtml, durationLabel, postEffectLabel,
     whMoney, whQty, whStockBadge,
     PAY_METHODS, PAY_METHOD_LABEL, PAY_STATE_LABEL, payCents, payRate, payRateCurrency, payConvert,
-    payMoney, payPreview, payPartLine, payConfirmable, payAwaitingText, payHandoverHtml, payHandoverOrdersHtml,
+    payMoney, payPreview, payPartLine, payConfirmable, orderItemsBrief, payAwaitingText, payHandoverHtml, payHandoverOrdersHtml,
     PAY_ACCOUNT_KIND, payAccountItems, payDefaultAccountId, payAccountPrefill, payAccountFormError,
     payAccountFieldHtml, payMissingAccount, payAccountsManagerHtml,
     payHandoverPicked, payDepositOrdersText,

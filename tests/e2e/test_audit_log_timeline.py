@@ -50,6 +50,7 @@ def test_order_card_shows_timeline_after_actions(open_app, e2e):
     tab(page, "orders")
     settled(page)
     card = page.locator(f'.order-card[data-id="{order["order_id"]}"]')
+    card.locator("[data-details-toggle]").click()
     card.locator("[data-timeline-toggle]").click()
     box = page.locator(f'#order-timeline-{order["order_id"]}')
     box.wait_for(state="visible")

@@ -4676,3 +4676,44 @@ describe('«Склад» → «Движения»: четыре вида одн�
     expect(mgr.__calls).not.toContain('/api/stock/transfers');
   });
 });
+
+describe('карточка заказа: краткая сводка и «Подробнее»', () => {
+  const ORDER = {
+    id: 33, status: 'shipped', agent_id: '7', agent_name: 'ООО Ромашка',
+    full_name: 'Менеджер', items_count: 3, created_at: '2026-09-16 10:00',
+    total: 900, currency: 'USD', payment_type: 'paid', is_mine: true,
+    items: [
+      { id: 1, name: 'Цемент', quantity: 1, unit: 'шт', price: 100 },
+      { id: 2, name: 'Кирпич', quantity: 2, unit: 'шт', price: 200 },
+      { id: 3, name: 'Песок', quantity: 3, unit: 'шт', price: 100 },
+    ],
+    payment_parts: [{ method: 'cash', amount_cents: 90000, currency: 'USD', state: 'on_hand' }],
+  };
+  const render = () => boot(`
+    currentUser = { role: 'manager', prefs: { work_actions: true } };
+    ordersData = { orders: ${JSON.stringify([ORDER])}, role: 'manager' };
+    renderOrdersMain();
+  `);
+
+  it('по умолчанию — одна строка с остатком, подробности свёрнуты', () => {
+    const content = render().document.getElementById('content');
+    const card = content.querySelector('.order-card[data-id="33"]');
+    expect(card.querySelector('.order-items-brief').textContent).toBe('Цемент, Кирпич и ещё 1');
+    expect(card.querySelector('#order-details-33').hidden).toBe(true);
+    expect(card.querySelector('[data-details-toggle="33"]').getAttribute('aria-expanded')).toBe('false');
+  });
+
+  it('«Подробнее» показывает ВСЕ товары и оплату и переживает перерисовку', () => {
+    const window = render();
+    const content = window.document.getElementById('content');
+    content.querySelector('[data-details-toggle="33"]').click();
+    const box = content.querySelector('#order-details-33');
+    expect(box.hidden).toBe(false);
+    expect(box.querySelectorAll('.order-item-preview')).toHaveLength(3);
+    expect(box.querySelector('.order-parts .pay-part-row .ic')).not.toBeNull();
+    window.eval('renderOrdersMain()');
+    expect(window.document.getElementById('order-details-33').hidden).toBe(false);
+    window.document.querySelector('[data-details-toggle="33"]').click();
+    expect(window.document.getElementById('order-details-33').hidden).toBe(true);
+  });
+});
