@@ -19,7 +19,8 @@ report/counterparty (сверка балансов).
 
 Использование:
     python -m scripts.migrate_history_from_moysklad --dry-run   # выгрузка + отчёт
-    python -m scripts.migrate_history_from_moysklad --apply --supplier-history ledger|settled
+    python -m scripts.migrate_history_from_moysklad --apply --supplier-history ledger|settled \
+        [--orders-owner-map "<сотрудник МС>=<telegram id>" ...] [--orders-owner-default <telegram id>]
 
 Код возврата: 0 — успех; 1 — ошибка или сверка не сошлась.
 
@@ -93,13 +94,20 @@ FSM не отображаются однозначно. Поэтому: есть
 — это плановая ОТГРУЗКА, другое), а подставить туда дату документа значит
 объявить просроченным всё подряд.
 
-**`user_id = 0`** у исторических заказов: в МС нет нашего Telegram-id, а
-приписать их живому менеджеру значит испортить его статистику продаж.
-Ноль честно означает «заказ приехал миграцией». Руководство видит такие
-заказы через `get_all_orders`, в «свои» они не попадают ни к кому. Если
-компанию ведёт один сотрудник с ролью manager, ему история с нулём не видна
-вовсе (ни в «Заказах», ни в «Долгах») — тогда `--orders-owner <telegram id>`
-записывает заказы на него (платежи остаются за «Перенос из МойСклад»).
+**ЧЬИ ЗАКАЗЫ — ПО АВТОРУ ДОКУМЕНТА В МС.** У каждого документа МС есть
+`owner` — сотрудник МС, который его оформил. Telegram-id в МС нет, поэтому
+соответствие задаёт человек: `--orders-owner-map "<сотрудник МС>=<telegram
+id>"` (ключ — логин `uid`, id или ФИО из таблицы сотрудников, которую печатает
+предпросмотр) и `--orders-owner-default <telegram id>` для остальных авторов и
+документов без автора. Без обоих — `user_id = 0` «Перенос из МойСклад»: такие
+заказы видит только руководство (менеджер видит в «Заказах» и «Долгах» только
+свои). Заказ получает автора заказа МС (продажа по отгрузке — автора
+отгрузки), платёж — автора платёжного документа; `user_id`/`full_name`/
+`username` — из `user_roles`, и цель обязана быть активным admin/boss/manager,
+иначе остановка до записи. Долг клиента в «Долгах» менеджера — это заказ с его
+`user_id`, то есть долг видит тот, на кого записан заказ. Сотрудники МС
+выгружаются из `entity/employee`: по голому UUID из `owner.meta.href` человек
+себя не узнает. `--orders-owner` — прежнее имя `--orders-owner-default`.
 
 ═══════════════════════════════════════════════════════════════════════════
 ПЕРЕНОС НА ЧИСТУЮ БАЗУ С ТЕКУЩЕЙ СХЕМОЙ (сентябрь 2026)
@@ -169,7 +177,9 @@ import os
 import sys
 import time
 from collections import defaultdict
+from dataclasses import dataclass, field
 from datetime import datetime
+from typing import NamedTuple
 from zoneinfo import ZoneInfo
 
 import aiohttp
@@ -574,6 +584,7 @@ async def pull_orders() -> list[dict]:
                 "agent_ms_id": _href_id(o.get("agent")),
                 "agent_name": ((o.get("agent") or {}).get("name")) or "",
                 "state_name": ((o.get("state") or {}).get("name")) or "",
+                "owner_ms_id": _href_id(o.get("owner")),
                 "sum_minor": int(o.get("sum") or 0),
                 "payed_minor": int(o.get("payedSum") or 0),
                 "shipped_minor": int(o.get("shippedSum") or 0),
@@ -603,6 +614,7 @@ async def pull_demands() -> list[dict]:
                 "agent_ms_id": _href_id(d.get("agent")),
                 "agent_name": ((d.get("agent") or {}).get("name")) or "",
                 "order_ms_id": _href_id(d.get("customerOrder")),
+                "owner_ms_id": _href_id(d.get("owner")),
                 "sum_minor": int(d.get("sum") or 0),
                 "_kind": "отгрузка",
                 **_doc_rate(d),
@@ -640,6 +652,7 @@ def _money_doc(p: dict, doc_type: str, kind: str) -> dict:
         "moment": p.get("moment") or "",
         "agent_ms_id": _href_id(p.get("agent")),
         "agent_name": ((p.get("agent") or {}).get("name")) or "",
+        "owner_ms_id": _href_id(p.get("owner")),
         "sum_minor": int(p.get("sum") or 0),
         "_kind": kind,
         **_doc_rate(p),
@@ -683,6 +696,7 @@ async def pull_supplies() -> list[dict]:
                 "moment": sp.get("moment") or "",
                 "agent_ms_id": _href_id(sp.get("agent")),
                 "agent_name": ((sp.get("agent") or {}).get("name")) or "",
+                "owner_ms_id": _href_id(sp.get("owner")),
                 "sum_minor": int(sp.get("sum") or 0),
                 "_kind": "поступление",
                 **_doc_rate(sp),
@@ -768,6 +782,36 @@ async def pull_counterparty_balances() -> list[dict] | None:
     return out
 
 
+async def pull_employees() -> list[dict] | None:
+    """Сотрудники МС (`entity/employee`) — кто есть кто среди авторов документов.
+
+    У документа автор — только ссылка `owner.meta.href` с UUID; по нему человек
+    себя в таблице не узнает, а ключ карты `--orders-owner-map` удобнее давать
+    логином или ФИО. None — справочник не получен (нет прав на сотрудников,
+    сбой): таблица покажет голые id, и ключом карты годится только id.
+    """
+    try:
+        rows = await fetch_paged("entity/employee")
+    except Exception as e:  # noqa: BLE001 — без ФИО перенос возможен, ключ — id
+        logger.warning("Сотрудники МС (entity/employee) не получены (%s) — в таблице будут только id", e)
+        return None
+    out = []
+    for e in rows:
+        ms_id = str(e.get("id") or _href_id(e))
+        if not ms_id:
+            continue
+        out.append({
+            "ms_id": ms_id,
+            "uid": str(e.get("uid") or ""),
+            "full_name": str(e.get("fullName") or e.get("name") or ""),
+            "short_fio": str(e.get("shortFio") or ""),
+            "name": str(e.get("name") or ""),
+            "archived": bool(e.get("archived")),
+        })
+    logger.info("Сотрудников МС: %d", len(out))
+    return out
+
+
 # ─── Сопоставление с уже перенесёнными справочниками ──────────────────────────
 
 
@@ -818,6 +862,8 @@ class Unmatched:
         # и сверка с балансами МС — готовые строки отчёта.
         self.preview: list[str] = []
         self.balance: list[str] = []
+        # На кого записаны заказы и платежи (`_summarize_owners`).
+        self.owners: list[str] = []
 
     def add(self, kind: str, what: str) -> None:
         self.buckets[kind].append(what)
@@ -917,6 +963,8 @@ async def write_history(
     balances: list[dict] | None = None,
     returns: list[dict] | None = None,
     orders_owner: int | None = None,
+    owner_map: list[tuple[str, int]] | None = None,
+    employees: list[dict] | None = None,
 ) -> tuple[dict, Unmatched, list[str]]:
     """Перенести историю одной транзакцией. Частично применённой не бывает.
 
@@ -954,6 +1002,11 @@ async def write_history(
     `supplier_history` — что делать с расчётами с поставщиками (см. докстринг
     модуля): `ledger` — приходы долги, выплаты их гасят; `settled` — все
     перенесённые приходы помечаются оплаченными, выплаты в ленту не пишутся.
+
+    `owner_map` (ключ сотрудника МС → Telegram-id), `orders_owner` (кому всё
+    остальное) и `employees` (справочник МС) решают, на кого пишутся заказы и
+    платежи (см. «ЧЬИ ЗАКАЗЫ» в докстринге модуля). Неразобранный ключ или
+    неактивная цель — `MigrationStop` до первой записи.
     """
     from services import adb_core
     from services.database import now_str
@@ -969,6 +1022,7 @@ async def write_history(
     problems: list[str] = []
 
     all_docs = [*orders, *demands, *payments, *(supplies or []), *(payments_out or [])]
+    plan = resolve_owner_map(owner_map, employees, all_docs, default=orders_owner)
     acct_iso, fx_problems = resolve_currencies(all_docs, currencies)
 
     class _Rollback(Exception):
@@ -984,8 +1038,11 @@ async def write_history(
                     + (f"\n  …и ещё {len(fx_problems) - 30}" if len(fx_problems) > 30 else "")
                 )
             product_map, cp_map = await load_maps(txn)
-            owner = await _orders_owner(txn, orders_owner)
-            stats["orders_owner"] = owner[0]
+            owners = await _resolve_owners(txn, plan)
+            stats["orders_owner"] = plan.default
+
+            def owner_of(doc: dict) -> Owner:
+                return owners[plan.target(doc.get("owner_ms_id"))]
             stats["products_known"] = len(product_map)
             stats["counterparties_known"] = len(cp_map)
 
@@ -1047,7 +1104,7 @@ async def write_history(
                     cp_id=cp_id, currency=currency, moment=moment,
                     fully_paid=False,  # состояние оплаты посчитаем после разнесения
                     fx=o["fx"],
-                    now=now, owner=owner,
+                    now=now, owner=owner_of(o),
                 )
                 order_local[o["ms_id"]] = order_id
                 order_book.append(
@@ -1126,7 +1183,7 @@ async def write_history(
                 order_id = await _upsert_order_from_demand(
                     txn, d,
                     cp_id=cp_id, currency=currency, moment=moment,
-                    fx=d["fx"], now=now, owner=owner,
+                    fx=d["fx"], now=now, owner=owner_of(d),
                 )
                 demand_order[d["ms_id"]] = order_id
                 order_book.append(
@@ -1181,7 +1238,8 @@ async def write_history(
                     continue
                 p["_needs_fifo"] = False
                 await _upsert_payment(
-                    txn, p, order_id=target_order, base_cur=base_cur, now=now
+                    txn, p, order_id=target_order, base_cur=base_cur, now=now,
+                    owner=owner_of(p),
                 )
                 if target_order in by_local_id:
                     by_local_id[target_order]["paid"] += p["sum_minor"]
@@ -1234,7 +1292,7 @@ async def write_history(
                     part += 1
                     await _upsert_payment(
                         txn, p, order_id=b["order_id"], base_cur=base_cur, now=now,
-                        amount_cents=take, part=part, fifo=True,
+                        amount_cents=take, part=part, fifo=True, owner=owner_of(p),
                     )
                     b["paid"] += take
                     left -= take
@@ -1381,6 +1439,7 @@ async def write_history(
             )
 
             _note_returns(returns or [], unmatched, stats)
+            await _summarize_owners(txn, owners, unmatched, stats)
             await _preview_app_state(txn, supplier_history, unmatched, stats)
             await _reconcile_balances(
                 txn, balances, acct_iso=acct_iso, cp_map=cp_map,
@@ -1473,6 +1532,47 @@ def _note_returns(returns: list[dict], unmatched: Unmatched, stats: dict) -> Non
         unmatched.note(
             "возвраты в МС не перенесены — долг по контрагенту может быть завышен/занижен",
             f"«{agent}»: {kind} — {n} на {_money(total)}",
+        )
+
+
+async def _summarize_owners(
+    txn, owners: dict[int, Owner], unmatched: Unmatched, stats: dict
+) -> None:
+    """На кого записаны перенесённые заказы и платежи — посчитано по базе.
+
+    «Долги» менеджера — открытые заказы с его `user_id` (`get_open_debts`), тем
+    же фильтром считается колонка «видит в Долгах»: сверять карту надо с тем,
+    что сотрудник увидит, а не с тем, что скрипт собирался записать.
+    """
+    from services.database import _OPEN_DEBT_FILTER
+
+    orders = {
+        int(r["user_id"]): (int(r["n"]), int(r["debts"] or 0))
+        for r in await txn.fetch(
+            "SELECT user_id, COUNT(*) AS n, "
+            f"SUM(CASE WHEN {_OPEN_DEBT_FILTER} THEN 1 ELSE 0 END) AS debts FROM orders "
+            "WHERE ms_customerorder_id IS NOT NULL OR ms_demand_id IS NOT NULL GROUP BY user_id"
+        )
+    }
+    payments = {
+        int(r["user_id"]): int(r["n"])
+        for r in await txn.fetch(
+            "SELECT user_id, COUNT(*) AS n FROM payments WHERE ms_paymentin_id IS NOT NULL "
+            "GROUP BY user_id"
+        )
+    }
+    stats["orders_owners"] = len(orders)
+    lines = unmatched.owners
+    for uid in sorted({*orders, *payments}):
+        member = owners.get(uid)
+        if member is None:
+            who = f"{uid} (записан прежним прогоном)"
+        else:
+            who = f"{uid} «{member.full_name}»" + (f" ({member.role})" if member.role else "")
+        n, debts = orders.get(uid, (0, 0))
+        lines.append(
+            f"{who}: заказов {n}, из них открытых долгов (видит в «Долгах») {debts}; "
+            f"строк платежей {payments.get(uid, 0)}"
         )
 
 
@@ -1718,36 +1818,269 @@ async def _set_order_payment_state(
         )
 
 
-async def _orders_owner(txn, user_id: int | None) -> tuple[int, str]:
-    """Чьими считать перенесённые заказы: (user_id, имя для `orders.full_name`).
+# ─── Чьи заказы и платежи: сотрудники МС → сотрудники бота ─────────────────────
+#
+# Автор документа МС (`owner`) — сотрудник МС; в боте сотрудник — Telegram-id из
+# `user_roles`. Соответствие задаёт человек (`--orders-owner-map`), потому что
+# связи между ними нигде нет (`user_roles.moysklad_employee_id` прежней
+# интеграции пуст). Порядок: предпросмотр печатает таблицу авторов → человек
+# находит в ней себя → подставляет ключ в карту.
 
-    По умолчанию — 0 («Перенос из МойСклад»): приписать историю живому
-    менеджеру значит испортить его статистику продаж. НО менеджер видит в
-    «Заказах» и «Долгах» только заказы со своим `user_id` (руководство — все),
-    и если компанию ведёт один человек с ролью manager, история с нулём ему
-    невидима целиком: долги клиентов не собрать. Для такого случая —
-    `--orders-owner <telegram id>`: сотрудник обязан быть в `user_roles`,
-    активен и с ролью, которая видит заказы; иначе остановка ДО записи.
-    Платежи остаются за «Перенос из МойСклад»: деньги вносил не он.
+LOGIN_ROLES = ("admin", "boss", "manager")
+NO_OWNER_LABEL = "(без автора)"
+# Виды документов в таблице авторов: (ключ, заголовок колонки). Поступления и
+# выплаты поставщикам автора в нашей базе не хранят — колонки только помогают
+# узнать сотрудника по его работе.
+OWNER_TABLE_KINDS: tuple[tuple[str, str], ...] = (
+    ("customerorder", "заказ"), ("demand", "отгр"), ("paymentin", "плат"), ("cashin", "ПКО"),
+    ("supply", "пост"), ("paymentout", "исх"), ("cashout", "РКО"),
+)
+
+
+class Owner(NamedTuple):
+    """Сотрудник бота, на которого пишутся заказ или платёж."""
+
+    user_id: int
+    full_name: str
+    username: str = ""
+    role: str = ""
+
+
+MIGRATION_OWNER = Owner(0, MIGRATION_AUTHOR)
+
+
+@dataclass
+class OwnerPlan:
+    """Кому что: сотрудник МС → Telegram-id, остальные → `default` (0 — никому)."""
+
+    by_employee: dict[str, int] = field(default_factory=dict)
+    default: int = 0
+    # Telegram-id → как он задан в командной строке (для текста остановки).
+    sources: dict[int, list[str]] = field(default_factory=dict)
+
+    def target(self, owner_ms_id: str | None) -> int:
+        return self.by_employee.get(owner_ms_id or "", self.default)
+
+
+def parse_owner_map_item(raw: str) -> tuple[str, int]:
+    """`"<сотрудник МС>=<telegram id>"` → (ключ, id). Разделитель — последний `=`."""
+    key, sep, tg = str(raw).rpartition("=")
+    key, tg = key.strip(), tg.strip()
+    if not sep or not key or not tg.isdigit() or int(tg) <= 0:
+        raise argparse.ArgumentTypeError(
+            f"{raw!r}: нужно «<сотрудник МС>=<telegram id>», например "
+            "\"farid@impeks=941599419\" (ключ — uid, id или ФИО из таблицы сотрудников)"
+        )
+    return key, int(tg)
+
+
+def _norm_key(value: str) -> str:
+    return " ".join(str(value).replace("ё", "е").replace("Ё", "Е").split()).casefold()
+
+
+def _employee_keys(e: dict) -> set[str]:
+    """Чем можно назвать сотрудника МС в карте: id, логин (целиком и до «@»), ФИО."""
+    uid = e.get("uid") or ""
+    keys = {e.get("ms_id"), uid, uid.split("@", 1)[0] if "@" in uid else "",
+            e.get("full_name"), e.get("short_fio"), e.get("name")}
+    return {_norm_key(k) for k in keys if k}
+
+
+def _employee_label(e: dict) -> str:
+    bits = [e.get("full_name") or e.get("name") or "", e.get("uid") or "", e.get("ms_id") or ""]
+    return " · ".join(b for b in bits if b) or "?"
+
+
+def _known_employees(employees: list[dict] | None, docs: list[dict]) -> dict[str, dict]:
+    """Сотрудники из справочника МС плюс авторы документов, которых в нём нет
+    (справочник не получен или сотрудник удалён) — последних знаем только по id."""
+    known = {e["ms_id"]: e for e in employees or []}
+    for d in docs:
+        oid = d.get("owner_ms_id") or ""
+        if oid and oid not in known:
+            known[oid] = {"ms_id": oid, "uid": "", "full_name": "", "short_fio": "", "name": "",
+                          "archived": False, "_not_in_directory": True}
+    return known
+
+
+def resolve_owner_map(
+    owner_map: list[tuple[str, int]] | None, employees: list[dict] | None, docs: list[dict],
+    *, default: int | None = None,
+) -> OwnerPlan:
+    """Карта из командной строки → `OwnerPlan`. Ничего не угадывает.
+
+    Ключ, который не нашёл сотрудника, нашёл двух, или один сотрудник на два
+    разных Telegram-id — остановка до записи: опечатка в ключе молча отдала бы
+    заказы владельца «по умолчанию», и это выглядело бы как верный перенос.
     """
-    if not user_id:
-        return 0, "Перенос из МойСклад"
-    row = await txn.fetchrow(
-        "SELECT role, full_name, deactivated_at FROM user_roles WHERE user_id = $1",
+    known = _known_employees(employees, docs)
+    plan = OwnerPlan(default=int(default or 0))
+    if plan.default:
+        plan.sources.setdefault(plan.default, []).append(f"--orders-owner-default {plan.default}")
+    errors: list[str] = []
+    for key, tg in owner_map or []:
+        nk = _norm_key(key)
+        hits = [e for e in known.values() if nk in _employee_keys(e)]
+        if not hits:
+            errors.append(f"«{key}»: нет такого сотрудника МС (ключ — id, uid или ФИО из таблицы)")
+            continue
+        if len(hits) > 1:
+            errors.append(
+                f"«{key}»: подходит нескольким сотрудникам МС — "
+                + "; ".join(_employee_label(e) for e in hits) + " — укажите uid или id"
+            )
+            continue
+        eid = hits[0]["ms_id"]
+        if eid in plan.by_employee and plan.by_employee[eid] != int(tg):
+            errors.append(
+                f"«{key}»: сотрудник {_employee_label(hits[0])} уже назначен на "
+                f"{plan.by_employee[eid]}, а здесь на {tg}"
+            )
+            continue
+        plan.by_employee[eid] = int(tg)
+        plan.sources.setdefault(int(tg), []).append(f"--orders-owner-map «{key}»={tg}")
+    if errors:
+        raise MigrationStop(
+            "--orders-owner-map не разобран — в базу ничего не записано:\n"
+            + "\n".join(f"  • {x}" for x in errors)
+        )
+    return plan
+
+
+async def _staff_member(db, user_id: int) -> tuple[Owner | None, str]:
+    """(сотрудник, пусто) — годится; (None, причина) — нет. `db` — транзакция или adb_core."""
+    row = await db.fetchrow(
+        "SELECT role, username, full_name, deactivated_at FROM user_roles WHERE user_id = $1",
         int(user_id),
     )
-    if row is None or row["deactivated_at"] or row["role"] not in ("admin", "boss", "manager"):
+    if row is None:
+        return None, "нет в user_roles"
+    if row["deactivated_at"]:
+        return None, f"{row['role']}, деактивирован"
+    if row["role"] not in LOGIN_ROLES:
+        return None, f"роль {row['role']} — заказы и долги не видит"
+    name = str(row["full_name"] or "").strip() or f"Сотрудник {user_id}"
+    return Owner(int(user_id), name, str(row["username"] or ""), str(row["role"])), ""
+
+
+async def _resolve_owners(db, plan: OwnerPlan) -> dict[int, Owner]:
+    """Все цели плана — активные admin/boss/manager. Иначе `MigrationStop` со всеми причинами."""
+    owners: dict[int, Owner] = {0: MIGRATION_OWNER}
+    errors: list[str] = []
+    for tg in sorted({*plan.by_employee.values(), plan.default} - {0}):
+        member, why = await _staff_member(db, tg)
+        if member is None:
+            how = ", ".join(plan.sources.get(tg) or [str(tg)])
+            errors.append(f"{how}: {why}")
+            continue
+        owners[tg] = member
+    if errors:
         raise MigrationStop(
-            f"--orders-owner {user_id}: нет активного сотрудника admin/boss/manager с таким "
-            "Telegram id в user_roles — заказы некому приписать"
+            "нет активного сотрудника admin/boss/manager с таким Telegram id — заказы и "
+            "платежи некому приписать, в базу ничего не записано:\n"
+            + "\n".join(f"  • {x}" for x in errors)
         )
-    return int(user_id), str(row["full_name"] or f"Сотрудник {user_id}")
+    return owners
+
+
+def _docs_by_kind(
+    orders: list[dict], demands: list[dict], payments: list[dict],
+    supplies: list[dict], payments_out: list[dict],
+) -> dict[str, list[dict]]:
+    out: dict[str, list[dict]] = {"customerorder": orders, "demand": demands, "supply": supplies}
+    for docs, kinds in ((payments, INCOMING_MONEY), (payments_out, OUTGOING_MONEY)):
+        for doc_type in kinds:
+            out[doc_type] = [d for d in docs if d.get("doc_type") == doc_type]
+    return out
+
+
+def owner_table_lines(
+    employees: list[dict] | None, docs_by_kind: dict[str, list[dict]], plan: OwnerPlan | None,
+    staff: dict[int, tuple[Owner | None, str]],
+) -> list[str]:
+    """Таблица «сотрудник МС → сколько документов → на кого уйдут».
+
+    Печатается ДО записи, в том числе когда карта не задана или не разобралась:
+    ради неё и делается первый предпросмотр дня переноса.
+    """
+    all_docs = [d for docs in docs_by_kind.values() for d in docs]
+    known = _known_employees(employees, all_docs)
+    counts: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for kind, docs in docs_by_kind.items():
+        for d in docs:
+            counts[d.get("owner_ms_id") or ""][kind] += 1
+
+    def target(eid: str) -> str:
+        if plan is None:
+            return "? (карта не разобрана)"
+        tg = plan.target(eid)
+        how = "по карте" if eid and eid in plan.by_employee else "по умолчанию"
+        if tg == 0:
+            return f"0 «{MIGRATION_AUTHOR}» — только руководству ({how})"
+        member, why = staff.get(tg, (None, "не проверен"))
+        if member is None:
+            return f"{tg} ✗ {why} — перенос остановится"
+        return f"{tg} «{member.full_name}» ({member.role}) — {how}"
+
+    head = f"  {'id сотрудника МС':<36}  {'uid (логин)':<24}  {'ФИО':<28}"
+    head += "".join(f"{title:>6}" for _, title in OWNER_TABLE_KINDS) + "  → на кого"
+    lines = [
+        "Ключ для --orders-owner-map \"<ключ>=<telegram id>\": uid, id или ФИО (регистр не важен).",
+        "На автора пишутся заказы (заказ МС или продажа по отгрузке) и входящие деньги;",
+        "поступления и выплаты поставщикам автора в базе не хранят — колонки для опознания.",
+        head,
+    ]
+    rows: list[tuple[str, dict | None]] = list(known.items())
+    if counts.get(""):
+        rows.append(("", None))
+    rows.sort(key=lambda r: (-sum(counts.get(r[0], {}).values()), _employee_label(r[1] or {})))
+    for eid, e in rows:
+        c = counts.get(eid, {})
+        if e is None:
+            ident, uid, fio = NO_OWNER_LABEL, "", ""
+        else:
+            ident, uid = eid, e.get("uid") or ""
+            fio = e.get("full_name") or e.get("name") or (
+                "(нет в справочнике сотрудников)" if e.get("_not_in_directory") else ""
+            )
+            if e.get("archived"):
+                fio = f"{fio} [архив]"
+        line = f"  {ident:<36}  {uid[:24]:<24}  {fio[:28]:<28}"
+        line += "".join(f"{c.get(kind, 0):>6}" for kind, _ in OWNER_TABLE_KINDS)
+        lines.append(f"{line}  → {target(eid)}")
+    return lines
+
+
+async def print_owner_table(
+    employees: list[dict] | None, docs_by_kind: dict[str, list[dict]],
+    owner_map: list[tuple[str, int]] | None, default: int | None,
+) -> OwnerPlan | None:
+    """Напечатать таблицу авторов; вернуть план или None, если карта не разобралась."""
+    from services import adb_core
+
+    all_docs = [d for docs in docs_by_kind.values() for d in docs]
+    error = ""
+    try:
+        plan: OwnerPlan | None = resolve_owner_map(owner_map, employees, all_docs, default=default)
+    except MigrationStop as e:
+        plan, error = None, str(e)
+    staff: dict[int, tuple[Owner | None, str]] = {}
+    if plan is not None:
+        for tg in {*plan.by_employee.values(), plan.default} - {0}:
+            staff[tg] = await _staff_member(adb_core, tg)
+    logger.info("")
+    logger.info("═══ СОТРУДНИКИ МОЙСКЛАД — АВТОРЫ ДОКУМЕНТОВ ═══")
+    for line in owner_table_lines(employees, docs_by_kind, plan, staff):
+        logger.info("%s", line)
+    if error:
+        logger.error("%s", error)
+    return plan
 
 
 async def _upsert_order(
     txn, o: dict, *, cp_id: int | None, currency: str, moment: str,
     fully_paid: bool, fx: float | None, now: str,
-    owner: tuple[int, str] = (0, "Перенос из МойСклад"),
+    owner: Owner = MIGRATION_OWNER,
 ) -> int:
     """Заказ по `ms_customerorder_id`. Повторный прогон обновляет, не дублирует.
 
@@ -1797,7 +2130,7 @@ async def _upsert_order(
 async def _upsert_order_from_demand(
     txn, d: dict, *, cp_id: int | None, currency: str, moment: str,
     fx: float | None, now: str,
-    owner: tuple[int, str] = (0, "Перенос из МойСклад"),
+    owner: Owner = MIGRATION_OWNER,
 ) -> int:
     """Отгрузка без заказа-основания → заказ. Идемпотентность по `ms_demand_id`.
 
@@ -1963,6 +2296,7 @@ async def _write_invoice(
 async def _upsert_payment(
     txn, p: dict, *, order_id: int, base_cur: str, now: str,
     amount_cents: int | None = None, part: int = 0, fifo: bool = False,
+    owner: Owner = MIGRATION_OWNER,
 ) -> None:
     """Платёж по `ms_paymentin_id` (партиальный UNIQUE — идемпотентность в схеме).
 
@@ -2004,7 +2338,8 @@ async def _upsert_payment(
     await txn.execute(
         "INSERT INTO payments (user_id, username, full_name, amount_cents, currency, "
         "comment, status, order_id, ms_paymentin_id, fx_rate_to_base, created_at, confirmed_at) "
-        "VALUES (0, '', 'Перенос из МойСклад', $1, $2, $3, 'confirmed', $4, $5, $6, $7, $8)",
+        "VALUES ($1, $2, $3, $4, $5, $6, 'confirmed', $7, $8, $9, $10, $11)",
+        owner.user_id, owner.username, owner.full_name,
         amount, currency, comment, order_id, key, fx, moment or now, moment,
     )
 
@@ -2261,11 +2596,7 @@ def print_report(
                 stats.get("orders", 0), stats.get("orders_from_demand", 0))
     logger.info("      из них оплачено : %5d  · в долг %d",
                 stats.get("orders_paid", 0), stats.get("orders_credit", 0))
-    logger.info(
-        "      записаны на     : %s",
-        f"сотрудника {stats['orders_owner']} (--orders-owner)" if stats.get("orders_owner")
-        else "user_id 0 — менеджеру не видны, только руководству (см. --orders-owner)",
-    )
+    logger.info("      записаны на     : см. «ЧЬИ ЗАКАЗЫ И ПЛАТЕЖИ» ниже")
     logger.info("  order_items         : %5d  (с карточкой товара %d)",
                 stats.get("order_items", 0), stats.get("order_items_linked", 0))
     logger.info("  invoices (отгрузки) : %5d  (позиций %d)",
@@ -2311,6 +2642,15 @@ def print_report(
         logger.info("СВЕДЕНИЯ (не ошибки переноса, но знать до переключения):")
         for line in unmatched.report(info=True):
             logger.info("%s", line)
+
+    if unmatched.owners:
+        logger.info("")
+        logger.info("═══ ЧЬИ ЗАКАЗЫ И ПЛАТЕЖИ (посчитано по записи в транзакции переноса) ═══")
+        for line in unmatched.owners:
+            logger.info("  %s", line)
+        if any(line.startswith("0 ") for line in unmatched.owners):
+            logger.info("  (user_id 0 видит только руководство; менеджеру — через "
+                        "--orders-owner-map / --orders-owner-default)")
 
     if unmatched.preview:
         logger.info("")
@@ -2522,8 +2862,11 @@ async def explain_order(name: str) -> int:
 
 
 async def main(
-    mode: str, *, supplier_history: str = "ledger", orders_owner: int | None = None
+    mode: str, *, supplier_history: str = "ledger", orders_owner: int | None = None,
+    owner_map: list[tuple[str, int]] | None = None,
 ) -> int:
+    """`orders_owner` — Telegram-id «по умолчанию» (`--orders-owner-default`),
+    `owner_map` — пары (ключ сотрудника МС, Telegram-id) из `--orders-owner-map`."""
     if mode.startswith("explain:"):
         try:
             return await explain_order(mode.split(":", 1)[1])
@@ -2539,6 +2882,7 @@ async def main(
         currencies = await pull_currencies()
         returns = await pull_returns()
         balances = await pull_counterparty_balances()
+        employees = await pull_employees()
 
         kinds = {
             "заказы": orders, "отгрузки": demands, "платежи": payments,
@@ -2551,13 +2895,20 @@ async def main(
             logger.error("%s", e)
             return 1
         print_preflight(kinds, currencies, fx_problems)
+        plan = await print_owner_table(
+            employees, _docs_by_kind(orders, demands, payments, supplies, payments_out),
+            owner_map, orders_owner,
+        )
+        if plan is None:
+            logger.error("ПЕРЕНОС ОСТАНОВЛЕН: исправьте --orders-owner-map по таблице выше")
+            return 1
 
         try:
             stats, unmatched, problems = await write_history(
                 orders, demands, payments, supplies, payments_out,
                 currencies=currencies, dry_run=(mode == "dry-run"),
                 supplier_history=supplier_history, balances=balances, returns=returns,
-                orders_owner=orders_owner,
+                orders_owner=orders_owner, owner_map=owner_map, employees=employees,
             )
         except MigrationStop as e:
             logger.error("")
@@ -2572,7 +2923,9 @@ async def main(
         if mode == "dry-run":
             logger.info("")
             logger.info(
-                "Это предпросмотр. Для записи: --apply --supplier-history ledger|settled"
+                "Это предпросмотр. Для записи: --apply --supplier-history ledger|settled "
+                "[--orders-owner-map \"<сотрудник МС>=<telegram id>\"] "
+                "[--orders-owner-default <telegram id>]"
             )
             return 1 if problems else 0
 
@@ -2612,13 +2965,36 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
              "Обязателен с --apply (решение по предпросмотру)",
     )
     p.add_argument(
+        "--orders-owner-map",
+        action="append",
+        type=parse_owner_map_item,
+        default=[],
+        metavar="СОТРУДНИК_МС=TELEGRAM_ID",
+        help="документы этого сотрудника МС (ключ — uid, id или ФИО из таблицы сотрудников "
+             "в --dry-run) записать на сотрудника бота; можно несколько раз",
+    )
+    p.add_argument(
+        "--orders-owner-default",
+        type=int,
+        metavar="TELEGRAM_ID",
+        help="на кого записать документы остальных авторов и без автора; без флага — "
+             "user_id 0 «Перенос из МойСклад» (видит только руководство)",
+    )
+    p.add_argument(
         "--orders-owner",
         type=int,
         metavar="TELEGRAM_ID",
-        help="записать перенесённые заказы на этого сотрудника (менеджер видит только "
-             "свои заказы и долги); по умолчанию — user_id 0",
+        help="устарело: то же, что --orders-owner-default",
     )
     args = p.parse_args(argv)
+    if args.orders_owner is not None and args.orders_owner_default is not None:
+        p.error("--orders-owner — прежнее имя --orders-owner-default: укажите что-то одно")
+    if args.orders_owner_default is None:
+        args.orders_owner_default = args.orders_owner
+    if args.orders_owner_default is not None and args.orders_owner_default <= 0:
+        p.error("--orders-owner-default: нужен Telegram id > 0")
+    if args.explain and (args.orders_owner_map or args.orders_owner_default):
+        p.error("--orders-owner-map/--orders-owner-default не имеют смысла с --explain")
     if args.apply and not args.supplier_history:
         p.error(
             "--apply требует --supplier-history ledger|settled: посмотрите блок "
@@ -2636,5 +3012,6 @@ if __name__ == "__main__":
     else:
         _mode = "dry-run" if args.dry_run else "apply"
     sys.exit(asyncio.run(main(
-        _mode, supplier_history=args.supplier_history or "ledger", orders_owner=args.orders_owner,
+        _mode, supplier_history=args.supplier_history or "ledger",
+        orders_owner=args.orders_owner_default, owner_map=args.orders_owner_map,
     )))

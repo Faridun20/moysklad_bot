@@ -159,6 +159,8 @@ def ms_api(monkeypatch):
         # скрипта); по умолчанию их нет, тесты подкладывают сами.
         "cashin": [], "cashout": [], "salesreturn": [], "purchasereturn": [],
         "currency": [USD_CUR, UZS_CUR],
+        # Сотрудники МС (entity/employee) — авторы документов (`owner`).
+        "employee": [],
     }
 
     async def fake_ms_get(path, params=None):
@@ -207,7 +209,7 @@ def seeded(isolated_db):
 
 
 def _run(ms_api, *, dry_run=False, supplier_history="ledger", balances=None, returns=None,
-         orders_owner=None):
+         orders_owner=None, owner_map=None):
     orders = asyncio.run(mig.pull_orders())
     demands = asyncio.run(mig.pull_demands())
     payments = asyncio.run(mig.pull_payments())
@@ -221,6 +223,7 @@ def _run(ms_api, *, dry_run=False, supplier_history="ledger", balances=None, ret
             orders, demands, payments, supplies, payments_out,
             currencies=currencies, dry_run=dry_run, supplier_history=supplier_history,
             balances=balances, returns=returns, orders_owner=orders_owner,
+            owner_map=owner_map, employees=asyncio.run(mig.pull_employees()),
         )
     )
 
@@ -1572,55 +1575,243 @@ def test_dry_run_reports_app_preview_and_balance_check(seeded, ms_api, caplog):
     assert _rows(seeded, "SELECT * FROM orders") == []
 
 
-# ─── Чьи заказы: --orders-owner ──────────────────────────────────────────────
+# ─── Чьи заказы: сотрудники МС → сотрудники бота ─────────────────────────────
+
+OWNER_TG, BOSS_TG = 941599419, 273791555
+EMP_OWNER, EMP_OTHER = "emp-farid", "emp-anvar"
 
 
-def test_orders_default_to_nobody_and_can_be_assigned_to_the_sole_manager(seeded, ms_api):
-    """Менеджер видит только свои заказы и долги. Владелец, который ведёт
-    компанию один с ролью manager, историю с user_id 0 не увидел бы вовсе —
-    поэтому `--orders-owner` записывает заказы на него, а платежи остаются
-    «Перенос из МойСклад» (деньги вносил не он)."""
-    import services.database as db
-
-    db.set_role(941599419, "owner", "Фаридун", "manager")
-    ms_api["customerorder"] = [_order(sum_minor=300000)]
-    ms_api["demand"] = [_demand(), _demand(ms_id="dem-2", name="D002", order_ms_id=None)]
-    ms_api["paymentin"] = [_paymentin(sum_minor=100000)]
-
-    stats, _, _ = _run(ms_api)
-    assert stats["orders_owner"] == 0
-    assert {r["user_id"] for r in _rows(seeded, "SELECT user_id FROM orders")} == {0}
-
-    stats, _, problems = _run(ms_api, orders_owner=941599419)
-    assert problems == [] and stats["orders_owner"] == 941599419
-    owners = _rows(seeded, "SELECT user_id, full_name FROM orders")
-    assert len(owners) == 2
-    assert {(r["user_id"], r["full_name"]) for r in owners} == {(941599419, "Фаридун")}
-    assert {r["full_name"] for r in _rows(seeded, "SELECT full_name FROM payments")} == {
-        "Перенос из МойСклад"
+def _employee(ms_id, uid, full_name, short_fio, *, archived=False):
+    """Сотрудник так, как его отдаёт entity/employee."""
+    return {
+        "meta": {"href": f"{_MS}/entity/employee/{ms_id}", "type": "employee"},
+        "id": ms_id, "uid": uid, "name": short_fio, "fullName": full_name,
+        "shortFio": short_fio, "archived": archived,
     }
 
-    # Ровно то, что увидит «Долги» менеджера: оба заказа не оплачены полностью.
-    debts = asyncio.run(db.get_open_debts(user_id=941599419))
-    assert sorted(d["ms_demand_id"] for d in debts) == ["dem-1", "dem-2"]
+
+def _by(doc, emp):
+    """Автор документа МС — ссылка на сотрудника, без expand."""
+    doc["owner"] = {"meta": {"href": f"{_MS}/entity/employee/{emp}", "type": "employee"}}
+    return doc
 
 
-def test_orders_owner_must_be_an_active_employee(seeded, ms_api):
+@pytest.fixture
+def two_authors(seeded, ms_api):
+    """Два сотрудника МС и два сотрудника бота: владелец (manager) и босс без имени
+    в user_roles — ровно как на проде 16.09."""
     import services.database as db
 
-    ms_api["customerorder"] = [_order()]
-    with pytest.raises(mig.MigrationStop, match="orders-owner 777"):
-        _run(ms_api, orders_owner=777)
+    db.set_role(OWNER_TG, "flext9m", "Фаридун", "manager")
+    db.set_role(BOSS_TG, "", "", "boss")
+    ms_api["employee"] = [
+        _employee(EMP_OWNER, "farid@impeks", "Масуджанов Фаридун", "Масуджанов Ф."),
+        _employee(EMP_OTHER, "anvar@impeks", "Анваров Анвар", "Анваров А."),
+    ]
+    # Заказ МС владельца (отгрузил другой), продажа по отгрузке другого,
+    # платёж другого по заказу владельца и платёж владельца по продаже другого.
+    ms_api["customerorder"] = [_by(_order(sum_minor=300000), EMP_OWNER)]
+    ms_api["demand"] = [
+        _by(_demand(), EMP_OTHER),
+        _by(_demand(ms_id="dem-2", name="D002", order_ms_id=None), EMP_OTHER),
+    ]
+    ms_api["paymentin"] = [
+        _by(_paymentin(sum_minor=100000), EMP_OTHER),
+        _by(_paymentin(ms_id="pay-2", sum_minor=50000, op=("demand", "dem-2")), EMP_OWNER),
+    ]
+    return seeded
+
+
+def test_without_owner_flags_history_belongs_to_nobody(two_authors, ms_api):
+    stats, _, problems = _run(ms_api)
+    assert problems == [] and stats["orders_owner"] == 0
+    assert {r["user_id"] for r in _rows(two_authors, "SELECT user_id FROM orders")} == {0}
+    assert {(r["user_id"], r["full_name"]) for r in _rows(two_authors, "SELECT * FROM payments")} == {
+        (0, "Перенос из МойСклад")
+    }
+
+
+def test_owner_map_splits_orders_payments_and_debts_between_two_ms_employees(two_authors, ms_api):
+    """Заказ — на автора заказа МС, продажа по отгрузке — на автора отгрузки,
+    платёж — на автора платежа; имя и username — из user_roles. «Долги»
+    менеджера — ровно заказы, записанные на него."""
+    import services.database as db
+
+    stats, unmatched, problems = _run(
+        ms_api, owner_map=[("farid@impeks", OWNER_TG), ("anvar@impeks", BOSS_TG)],
+    )
+    assert problems == []
+    orders = {r["ms_customerorder_id"] or r["ms_demand_id"]: (r["user_id"], r["full_name"])
+              for r in _rows(two_authors, "SELECT * FROM orders")}
+    assert orders == {"ord-1": (OWNER_TG, "Фаридун"), "dem-2": (BOSS_TG, f"Сотрудник {BOSS_TG}")}
+    pays = {r["ms_paymentin_id"]: (r["user_id"], r["username"], r["full_name"])
+            for r in _rows(two_authors, "SELECT * FROM payments")}
+    assert pays == {"pay-1": (BOSS_TG, "", f"Сотрудник {BOSS_TG}"),
+                    "pay-2": (OWNER_TG, "flext9m", "Фаридун")}
+
+    mine = asyncio.run(db.get_open_debts(user_id=OWNER_TG))
+    assert [d["ms_customerorder_id"] for d in mine] == ["ord-1"]
+    boss = asyncio.run(db.get_open_debts(user_id=BOSS_TG))
+    assert [d["ms_demand_id"] for d in boss] == ["dem-2"]
+
+    assert stats["orders_owners"] == 2
+    summary = "\n".join(unmatched.owners)
+    assert f"{OWNER_TG} «Фаридун» (manager): заказов 1, из них открытых долгов (видит в «Долгах») 1" in summary
+    assert f"{BOSS_TG} «Сотрудник {BOSS_TG}» (boss): заказов 1" in summary
+
+    # Ключ — ФИО (регистр, пробелы, ё) или id: тот же результат; повтор идемпотентен.
+    _run(ms_api, owner_map=[("  МАСУДЖАНОВ   фаридун ", OWNER_TG), (EMP_OTHER, BOSS_TG)])
+    again = {r["ms_customerorder_id"] or r["ms_demand_id"]: r["user_id"]
+             for r in _rows(two_authors, "SELECT * FROM orders")}
+    assert again == {"ord-1": OWNER_TG, "dem-2": BOSS_TG}
+    assert len(_rows(two_authors, "SELECT id FROM payments")) == 2
+
+
+def test_unmapped_or_missing_author_goes_to_default(two_authors, ms_api):
+    """Автор не в карте, автор, которого нет в справочнике сотрудников, и
+    документ без автора — всё на `--orders-owner-default`."""
+    ms_api["demand"].append(_by(_demand(ms_id="dem-3", name="D003", order_ms_id=None), "emp-fired"))
+    ms_api["demand"].append(_demand(ms_id="dem-4", name="D004", order_ms_id=None))  # без owner
+
+    _, _, problems = _run(ms_api, owner_map=[("farid", OWNER_TG)], orders_owner=BOSS_TG)
+    assert problems == []
+    orders = {r["ms_customerorder_id"] or r["ms_demand_id"]: r["user_id"]
+              for r in _rows(two_authors, "SELECT * FROM orders")}
+    assert orders == {"ord-1": OWNER_TG, "dem-2": BOSS_TG, "dem-3": BOSS_TG, "dem-4": BOSS_TG}
+
+    # Без default — не в карте значит «Перенос из МойСклад» (user_id 0).
+    _run(ms_api, owner_map=[("farid@impeks", OWNER_TG)])
+    orders = {r["ms_customerorder_id"] or r["ms_demand_id"]: r["user_id"]
+              for r in _rows(two_authors, "SELECT * FROM orders")}
+    assert orders == {"ord-1": OWNER_TG, "dem-2": 0, "dem-3": 0, "dem-4": 0}
+
+
+@pytest.mark.parametrize("owner_map, match", [
+    ([("nobody@impeks", OWNER_TG)], "nobody@impeks.*нет такого сотрудника"),
+    ([("impeks", OWNER_TG)], "нет такого сотрудника"),  # хвост логина — не ключ
+    ([("farid@impeks", OWNER_TG), (EMP_OWNER, BOSS_TG)], "уже назначен"),
+])
+def test_bad_owner_map_key_stops_before_write(two_authors, ms_api, owner_map, match):
+    with pytest.raises(mig.MigrationStop, match=match):
+        _run(ms_api, owner_map=owner_map, orders_owner=BOSS_TG)
+    assert _rows(two_authors, "SELECT id FROM orders") == []
+
+
+def test_ambiguous_owner_map_key_stops(two_authors, ms_api):
+    ms_api["employee"].append(_employee("emp-farid-2", "farid2@impeks", "Другой", "Масуджанов Ф."))
+    with pytest.raises(mig.MigrationStop, match="нескольким сотрудникам"):
+        _run(ms_api, owner_map=[("Масуджанов Ф.", OWNER_TG)])
+    assert _rows(two_authors, "SELECT id FROM orders") == []
+
+
+def test_owner_targets_must_be_active_staff_before_any_write(two_authors, ms_api):
+    import services.database as db
+
+    with pytest.raises(mig.MigrationStop, match="orders-owner-map «farid@impeks»=777: нет в user_roles"):
+        _run(ms_api, owner_map=[("farid@impeks", 777)], orders_owner=BOSS_TG)
     db.set_role(778, "g", "Гость", "guest")
-    with pytest.raises(mig.MigrationStop, match="orders-owner 778"):
-        _run(ms_api, orders_owner=778)
-    assert _rows(seeded, "SELECT id FROM orders") == [], "остановка — до записи"
+    with pytest.raises(mig.MigrationStop, match="orders-owner-default 778: роль guest"):
+        _run(ms_api, owner_map=[("farid@impeks", OWNER_TG)], orders_owner=778)
+    asyncio.run(db.deactivate_user(OWNER_TG, by=BOSS_TG))
+    with pytest.raises(mig.MigrationStop, match="941599419: manager, деактивирован"):
+        _run(ms_api, owner_map=[("farid@impeks", OWNER_TG)], orders_owner=BOSS_TG)
+    with pytest.raises(mig.MigrationStop, match="orders-owner-default 941599419: manager, деактивирован"):
+        _run(ms_api, orders_owner=OWNER_TG)  # прежний --orders-owner — те же проверки
+    assert _rows(two_authors, "SELECT id FROM orders") == [], "остановка — до записи"
+    assert _rows(two_authors, "SELECT id FROM payments") == []
 
 
-def test_orders_owner_cli_flag():
-    args = mig._parse_args(["--apply", "--supplier-history", "settled", "--orders-owner", "941599419"])
-    assert args.orders_owner == 941599419
-    assert mig._parse_args(["--dry-run"]).orders_owner is None
+def test_dry_run_prints_ms_employee_table_with_targets(two_authors, ms_api, caplog):
+    import logging
+
+    ms_api["demand"].append(_demand(ms_id="dem-4", name="D004", order_ms_id=None))  # без owner
+    with caplog.at_level(logging.INFO, logger="ms_history"):
+        rc = asyncio.run(mig.main("dry-run", owner_map=[("farid@impeks", OWNER_TG)],
+                                  orders_owner=BOSS_TG))
+    assert rc == 0
+    lines = caplog.text.splitlines()
+    head = lines.index(next(x for x in lines if "СОТРУДНИКИ МОЙСКЛАД" in x))
+    table = "\n".join(lines[head:head + 9])
+    farid = next(x for x in lines[head:] if EMP_OWNER in x)
+    anvar = next(x for x in lines[head:] if EMP_OTHER in x)
+    nobody = next(x for x in lines[head:] if "(без автора)" in x)
+    assert "farid@impeks" in farid and "Масуджанов Фаридун" in farid
+    # колонки: заказ отгр плат ПКО пост исх РКО
+    assert farid.split("→")[0].split()[-7:] == ["1", "0", "1", "0", "0", "0", "0"]
+    assert anvar.split("→")[0].split()[-7:] == ["0", "2", "1", "0", "0", "0", "0"]
+    assert nobody.split("→")[0].split()[-7:] == ["0", "1", "0", "0", "0", "0", "0"]
+    assert f"→ {OWNER_TG} «Фаридун» (manager) — по карте" in farid
+    assert f"→ {BOSS_TG} «Сотрудник {BOSS_TG}» (boss) — по умолчанию" in anvar
+    assert "заказ  отгр  плат   ПКО  пост   исх   РКО  → на кого" in table
+    assert "ЧЬИ ЗАКАЗЫ И ПЛАТЕЖИ" in caplog.text
+    assert _rows(two_authors, "SELECT * FROM orders") == []
+
+
+def test_dry_run_without_map_shows_table_and_bad_map_stops_after_it(two_authors, ms_api, caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="ms_history"):
+        assert asyncio.run(mig.main("dry-run")) == 0
+    anvar = next(x for x in caplog.text.splitlines() if EMP_OTHER in x and "→" in x)
+    assert "→ 0 «Перенос из МойСклад» — только руководству (по умолчанию)" in anvar
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="ms_history"):
+        rc = asyncio.run(mig.main("dry-run", owner_map=[("farid@impek", OWNER_TG)]))
+    assert rc == 1
+    text = caplog.text
+    assert "СОТРУДНИКИ МОЙСКЛАД" in text and "farid@impeks" in text
+    assert "«farid@impek»: нет такого сотрудника МС" in text
+    assert "ПЕРЕНОС ОСТАНОВЛЕН" in text
+
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="ms_history"):
+        rc = asyncio.run(mig.main("dry-run", owner_map=[("farid@impeks", 777)]))
+    assert rc == 1
+    assert "777 ✗ нет в user_roles — перенос остановится" in caplog.text
+    assert "ПЕРЕНОС ОСТАНОВЛЕН" in caplog.text
+
+
+def test_employee_directory_unavailable_still_maps_by_id(two_authors, ms_api, monkeypatch):
+    """Нет прав на entity/employee — перенос не падает, ключом годится id автора."""
+    real = mig.ms_get
+
+    async def no_employees(path, params=None):
+        if path == "entity/employee":
+            raise RuntimeError("403")
+        return await real(path, params)
+
+    monkeypatch.setattr(mig, "ms_get", no_employees)
+    assert asyncio.run(mig.pull_employees()) is None
+    _, _, problems = _run(ms_api, owner_map=[(EMP_OWNER, OWNER_TG)], orders_owner=BOSS_TG)
+    assert problems == []
+    orders = {r["ms_customerorder_id"] or r["ms_demand_id"]: r["user_id"]
+              for r in _rows(two_authors, "SELECT * FROM orders")}
+    assert orders == {"ord-1": OWNER_TG, "dem-2": BOSS_TG}
+    with pytest.raises(mig.MigrationStop, match="нет такого сотрудника"):
+        _run(ms_api, owner_map=[("farid@impeks", OWNER_TG)])
+
+
+def test_orders_owner_cli_flags():
+    args = mig._parse_args([
+        "--apply", "--supplier-history", "ledger",
+        "--orders-owner-map", "farid@impeks=941599419",
+        "--orders-owner-map", "Масуджанов Фаридун = 941599419",
+        "--orders-owner-default", "273791555",
+    ])
+    assert args.orders_owner_map == [("farid@impeks", 941599419), ("Масуджанов Фаридун", 941599419)]
+    assert args.orders_owner_default == 273791555
+    legacy = mig._parse_args(["--apply", "--supplier-history", "settled", "--orders-owner", "941599419"])
+    assert legacy.orders_owner_default == 941599419 and legacy.orders_owner_map == []
+    plain = mig._parse_args(["--dry-run"])
+    assert plain.orders_owner_default is None and plain.orders_owner_map == []
+    for bad in (["--dry-run", "--orders-owner-map", "farid@impeks"],
+                ["--dry-run", "--orders-owner-map", "farid=abc"],
+                ["--dry-run", "--orders-owner-map", "=941599419"],
+                ["--dry-run", "--orders-owner", "1", "--orders-owner-default", "2"],
+                ["--explain", "00001", "--orders-owner-default", "2"]):
+        with pytest.raises(SystemExit):
+            mig._parse_args(bad)
 
 
 # ─── Платежи без разбивки ────────────────────────────────────────────────────

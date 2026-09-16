@@ -245,3 +245,48 @@ def test_history_import_under_all_constraints_ledger(pg_constrained, ms_api):
             stats["supplier_advances"]) == (1, 1, 0)
     assert "supplier_debts" in _queue_keys()
     assert stats["payments_out"] == 2
+
+
+def test_history_owner_map_on_postgres_under_constraints(pg_constrained, ms_api):
+    """Карта авторов МС → сотрудники бота на настоящем Postgres со всеми CHECK/FK:
+    заказы и платежи ложатся на двух сотрудников, «Долги» менеджера — его заказы,
+    сводка считается тем же фильтром долга, что и экран."""
+    import services.database as database
+
+    db = pg_constrained
+    _full_history(ms_api)
+    ms_api["employee"] = [
+        hist._employee("emp-m", "manager@acc", "Менеджеров Иван", "Менеджеров И."),
+        hist._employee("emp-b", "boss@acc", "Боссов Пётр", "Боссов П."),
+    ]
+    for doc in ms_api["customerorder"]:
+        hist._by(doc, "emp-m")
+    hist._by(ms_api["demand"][1], "emp-b")          # продажа по отгрузке D2
+    hist._by(ms_api["cashin"][0], "emp-b")          # приходный ордер по D2
+    hist._by(ms_api["paymentin"][0], "emp-m")       # платёж по заказу P1
+
+    stats, unmatched, problems = hist._run(
+        ms_api, owner_map=[("manager@acc", 1)], orders_owner=2,
+    )
+    hist._run(ms_api, owner_map=[("Менеджеров Иван", 1)], orders_owner=2)  # повтор
+
+    assert problems == []
+    _assert_constraints_still_clean()
+    by_user = {}
+    for r in hist._rows(db, "SELECT user_id, ms_customerorder_id, ms_demand_id FROM orders"):
+        by_user.setdefault(r["user_id"], set()).add(r["ms_customerorder_id"] or r["ms_demand_id"])
+    assert by_user == {1: {"ord-part", "ord-open"}, 2: {"dem-sale"}}
+    # Приходный ордер разнесён FIFO на две строки (`cin-sale`, `cin-sale#2`) —
+    # обе на автора ордера, а не на владельцев заказов, которые он гасит.
+    pays = {(r["ms_paymentin_id"].split("#")[0], r["user_id"], r["full_name"])
+            for r in hist._rows(db, "SELECT * FROM payments")}
+    assert pays == {("pay-part", 1, "Manager"), ("cin-sale", 2, "Boss")}
+    # Приходный ордер без основания гасит по FIFO самый старый заказ контрагента
+    # (O1 менеджера) — долг остаётся за продажей D2, и видит его босс.
+    assert asyncio.run(database.get_open_debts(user_id=1)) == []
+    assert [d["ms_demand_id"] for d in asyncio.run(database.get_open_debts(user_id=2))] == ["dem-sale"]
+    assert stats["orders_owners"] == 2
+    assert unmatched.owners == [
+        "1 «Manager» (manager): заказов 2, из них открытых долгов (видит в «Долгах») 0; строк платежей 1",
+        "2 «Boss» (boss): заказов 1, из них открытых долгов (видит в «Долгах») 1; строк платежей 2",
+    ]
