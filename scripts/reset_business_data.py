@@ -220,6 +220,7 @@ WIPE: dict[str, str] = {
     "product_prices": "цены",
     "product_photos": "фото товаров",
     "counterparties": "клиенты и поставщики",
+    "counterparty_requisites": "ИНН и адрес покупателя для документов",
     # Себестоимость
     "cost_batches": "партии себестоимости",
     "sale_costs": "себестоимость отгрузок",
